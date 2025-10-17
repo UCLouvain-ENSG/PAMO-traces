@@ -1,6 +1,14 @@
 # PAMO trace scripts
 
-Scripts to split and accelerate a trace used for PAMO
+Scripts to split and accelerate a trace. This was used for PAMO evaluation on real traffic, accelerated from the ~3Gbps to up to ~70.
+
+The naive approach would just accelerate the replay speed by 20 times. This would make flows 20 times shorter, so the number of active flows at any time would be around 20 times smaller.
+Also, this could cause unrealistic edge-cases where the SYN and ACK get so close that they follow each other.
+
+The overall technique is to split the traffic in 30 second windows. Then rewrite them using different prefix.
+Then, we can replay all the "splits" in parallel as flows that would span two windows would not appear to collide anymore. To play on the overall speed, one can simply replay less or more windows in parallel.
+With 20 windows, that would lead to some aliasing. So we split again the windows in a flow-aware fashion in 4 files each. That gives, in the end, a ~1Gbps granularity.
+
 
 ## Dependencies
 
@@ -55,7 +63,7 @@ loss of nanosecond precision when anonymizing the trace
 needs to compile libtrace from [the GitHub
 version](https://github.com/LibtraceTeam/libtrace).
 
-## Recording
+## Capture
 
 It was quickly established that tcpdump was dropping too many packets.
 
@@ -72,6 +80,7 @@ It allows the following features:
 
 FastClick configuration (capture.click):
 
+```
         define($desc 16384)
 
         DPDKInfo(2000000);
@@ -143,12 +152,13 @@ FastClick configuration (capture.click):
             read fd0.xstats,
             read fd1.xstats
         );
+```
 
 During capture, the counters showed no dropped packets. The main
 bottleneck appeared to be the NVMe drive, as \~9Gbps is a lot. The RAM
 was enough to absorb the peaks though.
 
-## Anonymisation + Copy over SSH {#anonymisation--copy-over-ssh}
+## Anonymisation + Copy over SSH
 
 `$k` is a randomly generated key.
 
@@ -158,8 +168,9 @@ cat trace-in.pcap | traceanon -c \"$k\" -s pcapfile:- pcapfile:- | gzip -c | ssh
 
 Use traceanon `-d` on the other side.
 
+## Trace acceleration
 
-## Trace replay
+Note that this pipeline is IPv4-only.
 
 ### Splitting the trace in 30 seconds window
 
@@ -172,28 +183,28 @@ tracesplit -i 30 pcapfile:bigtrace.pcap pcapfile:splits/smalltraces.pcap
 
 ### Rewriting windows
 
-Then rewrite each trace to have flow in a unique prefix:
-parallel.sh splits/smalltrace.XXXX.pcap spltis/smalltrace.YYYY.pcap [...]
+Then rewrite each trace to have flow in a unique prefix. The rewriting is adding 65536 to the "internal" IP address of the trace. As we now our trace uses a /16 suffix on the "internal" side of the campus, it is sufficient.
 
-FastClick is used again, the configuration is in `pcap-rewrite-bidirect.click`
+FastClick is used again, the configuration is in `pcap-rewrite-bidirect.click`. Be sure to change the v4prefix to the /16 prefix of the "internal" side of your campus. If it has a different mask then you have to change the script. If you use something where an internal side has no sense (like an IXP, such as the caida trace), then you should not run an IDS on that because nobody should inspect the content of packets that are not theirs.
 
 ```bash
 for i in $(seq 0 15) ; do list=(window-30-ipv4_000$(printf "%02d" $i)*.pcap) && sudo LD_LIBRARY_PATH=$LD_LIBRARY_PATH ~/workspace/fastclick/bin/click -- pcap-rewrite-bidirect.click trace=$list[1] traceOUT=window-30-ipv4-rewrite.pcap-$i shiftip=$((65536 * $i)) shiftport=$((1000 * $i)) print=false ; done
 ```
 
 You now have 30 seconds window with a different prefix for each one.
+We also shift ports to avoid creating an artificial skew in the hashing done by RSS.
 
 
 ## Splitting the trace again
 
-The merged trace will then be re-split in a flow-aware fashion. We need to split the packets to
-enable parallel replay of the trace, using multiple cores and dedicated
-queues. We need it to be flow-aware because using independent threads
+The merged trace will then be re-split in a flow-aware fashion each windows in 4 "parallel" windows.
+We need it to be flow-aware because using independent threads
 might lead to some inter-thread reordering. PAMO's statistic would
 then see too much reordering which would be entierly artificial.
 
 FastClick is used again.
 
+```
     //Split a trace in 4 sub-traces using RR
     define($trace /tmp/in.pcap)
     define($snap 2000)
@@ -221,10 +232,29 @@ FastClick is used again.
     rr[1] -> ToDump($(outtrace)-2, FORCE_TS true, SNAPLEN $snap) ;
     rr[2] -> ToDump($(outtrace)-3, FORCE_TS true, SNAPLEN $snap) ;
     rr[3] -> ToDump($(outtrace)-4, FORCE_TS true, SNAPLEN $snap) ;
+````
 
-### Replay
+## Trace replay
 
 The fastclick-play-single-mt module of NPF is used to replay the trace.
-With the timing tag it replays at the original speed. Without the timing
+With the timing tag it replays at the original speed, accelerated by a `TIMING_FNT` in percent. Without the timing
 tag it replays as fast as possible, reaching 100G. This is not a valid
-acceleration. See the main README to use parallel window instead.
+acceleration, as explained above.
+
+The GEN_MULTI_TRACE variable is used to run the multiple traces.
+Assuming all your small windows are named `/path/to/trace.pcap-1`, `/path/to/trace.pcap-2` ...:
+```
+python3 npf.py local --test replay.npf --cluster client=elrond --tags promisc  scale_multi_trace --variables GEN_MULTI_TRACE=20 GEN_BLOCKING=true trace=/path/to/trace.pcap PKTGEN_REPLAY_COUNT=1 GEN_RX_THREADS=4 GEN_THREADS=4 GEN_CSUM=0 --tags trace_is_ip --show-cmd --show-files --preserve-temporaries
+```
+
+## Example for trace duplication
+Altough a slightly different use-case, we can use the prefix-rewriting script to duplicate a trace in a way that will prevent collisions.
+
+In this example we use `2015-07-28_mixed.before.infection.pcap` from [Stratosphere](https://mcfp.felk.cvut.cz/publicDatasets/CTU-Mixed-Capture-1/).
+
+```bash
+for i in $(seq 64)
+do
+    LD_LIBRARY_PATH=$LD_LIBRARY_PATH ~/workspace/fastclick/bin/click -- ../PAMO-traces/pcap-rewrite-bidirect.click trace=/mnt/traces4/2015-07-28_mixed.before.infection.pcap traceOUT=/mnt/traces2/strato.pcap-$i shiftip=$((65536 * $i)) shiftport=$((1000 * $i)) v4prefix=0a00
+done
+```
